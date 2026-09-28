@@ -20,9 +20,13 @@
 #include <jni.h>
 #include <string.h>
 
+#include <atomic>
+#include <mutex>
+
 #include "perfetto/public/abi/atomic.h"
 #include "perfetto/public/abi/data_source_abi.h"
 #include "perfetto/public/abi/stream_writer_abi.h"
+#include "perfetto/public/producer.h"
 #include "perfetto/public/stream_writer.h"
 #include "src/android_sdk/jni/macros.h"
 #include "src/android_sdk/nativehelper/JNIHelp.h"
@@ -39,8 +43,10 @@ namespace {
 struct DsState {
   struct PerfettoDsImpl* ds_impl;
   // Points to the native atomic enabled flag. True when any instance is active.
-  // Used by OnStop to decide whether to disable the Java fast path.
   PERFETTO_ATOMIC(bool) * enabled_ptr;
+  // Bitmask of instances that have been started and not yet stopped. Used by
+  // OnStop to decide whether to disable the Java fast path.
+  std::atomic<uint32_t> active_instances{0};
   // Global ref to the Java PerfettoDataSource object.
   jobject java_ds_global_ref;
   // Cached JVM pointer for callbacks from arbitrary threads.
@@ -59,10 +65,41 @@ struct IncrState {
   bool was_cleared;
 };
 
+// Data source callbacks are invoked on Perfetto-owned threads (e.g. the
+// producer IPC thread) which are not attached to the JVM. Attach them on
+// first use as daemon threads so they never block VM shutdown. They stay
+// attached for their lifetime, which is the lifetime of the process.
 JNIEnv* GetJNIEnv(JavaVM* jvm) {
   JNIEnv* env = nullptr;
-  jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  jint res = jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+  if (res == JNI_EDETACHED) {
+    JavaVMAttachArgs args{JNI_VERSION_1_6,
+                          const_cast<char*>("PerfettoDsCallback"), nullptr};
+#if defined(__ANDROID__)
+    jint attach_res = jvm->AttachCurrentThreadAsDaemon(&env, &args);
+#else
+    jint attach_res =
+        jvm->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env), &args);
+#endif
+    if (attach_res != JNI_OK) {
+      return nullptr;
+    }
+  } else if (res != JNI_OK) {
+    return nullptr;
+  }
   return env;
+}
+
+// Clears (and logs) any pending Java exception thrown from a callback, so
+// that a misbehaving data source can't abort the process from a native
+// thread.
+void CheckAndClearException(JNIEnv* env, const char* where) {
+  if (env->ExceptionCheck()) {
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG,
+                        "Exception thrown in PerfettoDataSource.%s", where);
+    env->ExceptionDescribe();
+    env->ExceptionClear();
+  }
 }
 
 // ============================================================================
@@ -84,6 +121,7 @@ void* OnSetup(struct PerfettoDsImpl*,
                               reinterpret_cast<const jbyte*>(ds_config));
       env->CallVoidMethod(state->java_ds_global_ref, state->on_setup_mid,
                           static_cast<jint>(inst_id), config);
+      CheckAndClearException(env, "onSetup");
       env->DeleteLocalRef(config);
     }
   }
@@ -96,12 +134,15 @@ void OnStart(struct PerfettoDsImpl*,
              void*,
              struct PerfettoDsOnStartArgs*) {
   auto* state = static_cast<DsState*>(user_arg);
+  state->active_instances.fetch_or(1u << inst_id, std::memory_order_acq_rel);
   JNIEnv* env = GetJNIEnv(state->jvm);
   if (env) {
     env->CallVoidMethod(state->java_ds_global_ref,
                         state->on_enabled_changed_mid, JNI_TRUE);
+    CheckAndClearException(env, "onEnabledChanged");
     env->CallVoidMethod(state->java_ds_global_ref, state->on_start_mid,
                         static_cast<jint>(inst_id));
+    CheckAndClearException(env, "onStart");
   }
 }
 
@@ -111,18 +152,24 @@ void OnStop(struct PerfettoDsImpl*,
             void*,
             struct PerfettoDsOnStopArgs*) {
   auto* state = static_cast<DsState*>(user_arg);
+  // Note: the C SDK's own enabled flag (enabled_ptr) is only cleared *after*
+  // this callback returns, so it can't be used here to decide whether this
+  // was the last active instance. Track that ourselves instead.
+  uint32_t remaining = state->active_instances.fetch_and(
+                           ~(1u << inst_id), std::memory_order_acq_rel) &
+                       ~(1u << inst_id);
   JNIEnv* env = GetJNIEnv(state->jvm);
   if (env) {
-    // Only disable the Java fast path if no instances remain active.
-    // The native enabled_ptr is an atomic bool managed by the C SDK that
-    // is true when at least one instance is active.
-    if (!PERFETTO_ATOMIC_LOAD_EXPLICIT(*state->enabled_ptr,
-                                       PERFETTO_MEMORY_ORDER_RELAXED)) {
-      env->CallVoidMethod(state->java_ds_global_ref,
-                          state->on_enabled_changed_mid, JNI_FALSE);
-    }
+    // Let the data source emit a final packet (e.g. a keyframe) while this
+    // instance is still writable.
     env->CallVoidMethod(state->java_ds_global_ref, state->on_stop_mid,
                         static_cast<jint>(inst_id));
+    CheckAndClearException(env, "onStop");
+    if (remaining == 0) {
+      env->CallVoidMethod(state->java_ds_global_ref,
+                          state->on_enabled_changed_mid, JNI_FALSE);
+      CheckAndClearException(env, "onEnabledChanged");
+    }
   }
 }
 
@@ -136,6 +183,7 @@ void OnFlush(struct PerfettoDsImpl*,
   if (env) {
     env->CallVoidMethod(state->java_ds_global_ref, state->on_flush_mid,
                         static_cast<jint>(inst_id));
+    CheckAndClearException(env, "onFlush");
   }
 }
 
@@ -310,11 +358,34 @@ static void nativeFlush(jlong ds_ptr) {
   }
 }
 
+// Initializes the Perfetto producer. Idempotent: only the first call has an
+// effect. Must be called before register().
+static void nativeInitProducer(JNIEnv*,
+                               jclass,
+                               jboolean in_process,
+                               jboolean system,
+                               jint shmem_size_hint_kb) {
+  static std::once_flag once;
+  std::call_once(once, [&] {
+    struct PerfettoProducerInitArgs args = PERFETTO_PRODUCER_INIT_ARGS_INIT();
+    args.backends = 0;
+    if (in_process)
+      args.backends |= PERFETTO_BACKEND_IN_PROCESS;
+    if (system)
+      args.backends |= PERFETTO_BACKEND_SYSTEM;
+    if (shmem_size_hint_kb > 0)
+      args.shmem_size_hint_kb = static_cast<uint32_t>(shmem_size_hint_kb);
+    PerfettoProducerInit(args);
+  });
+}
+
 // ============================================================================
 // JNI registration
 // ============================================================================
 
 static const JNINativeMethod gMethods[] = {
+    {"nativeInitProducer", "(ZZI)V",
+     reinterpret_cast<void*>(nativeInitProducer)},
     {"nativeRegister",
      "(Ldev/perfetto/sdk/PerfettoDataSource;Ljava/lang/String;)J",
      reinterpret_cast<void*>(nativeRegister)},

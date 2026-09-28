@@ -8,8 +8,8 @@ if (enable_perfetto_integration_tests) {
       "../../gn:gtest_and_gmock",
       "../../include/perfetto/public",
       "../base",
+      "../shared_lib",
       "../shared_lib:for_testing",
-      "../shared_lib:shared_lib",
       "../shared_lib/test:utils",
       "../shared_lib/test/protos",
     ]

@@ -69,6 +69,39 @@ public abstract class PerfettoDataSource {
     // Per-thread TraceContext. Allocated once, then reused forever.
     final ThreadLocal<TraceContext> mTlsContext = new ThreadLocal<>();
 
+    private static final Object sInitLock = new Object();
+    private static boolean sLibraryLoaded;
+
+    /**
+     * Name of the JNI library loaded by {@link #initialize}. Apps embedding the
+     * SDK ship this library in their APK.
+     */
+    public static final String JNI_LIBRARY_NAME = "perfetto_datasource_jni";
+
+    /** Backend: connect to the system tracing service (traced). */
+    public static final int BACKEND_SYSTEM = 1;
+    /** Backend: in-process tracing service (tests, self-contained traces). */
+    public static final int BACKEND_IN_PROCESS = 2;
+
+    /**
+     * Loads the JNI library (unless already loaded, e.g. by the platform) and
+     * initializes the Perfetto producer with the given backends. Idempotent;
+     * must be called before {@link #register}.
+     *
+     * @param backends bitwise-or of {@link #BACKEND_SYSTEM} and
+     *     {@link #BACKEND_IN_PROCESS}.
+     */
+    public static void initialize(int backends) {
+        synchronized (sInitLock) {
+            if (!sLibraryLoaded) {
+                System.loadLibrary(JNI_LIBRARY_NAME);
+                sLibraryLoaded = true;
+            }
+        }
+        nativeInitProducer((backends & BACKEND_IN_PROCESS) != 0,
+                (backends & BACKEND_SYSTEM) != 0, 0);
+    }
+
     /**
      * Register this data source with the tracing service.
      *
@@ -119,7 +152,10 @@ public abstract class PerfettoDataSource {
     // JNI
     // ====================================================================
 
-    @FastNative
+    static native void nativeInitProducer(
+            boolean inProcess, boolean system, int shmemSizeHintKb);
+
+    // Not @FastNative: registration can block on IPC with the service.
     static native long nativeRegister(PerfettoDataSource ds, String name);
 
     @CriticalNative
